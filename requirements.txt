@@ -1,0 +1,2 @@
+# P0 depends only on the Volcengine Ark SDK for chat + embedding.
+volcengine-python-sdk>=5.0.48

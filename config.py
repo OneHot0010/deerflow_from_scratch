@@ -52,3 +52,12 @@ def require_api_key() -> str:
             "Volcengine Ark API key, or export ARK_API_KEY in your shell."
         )
     return ARK_API_KEY
+
+
+# --- P3: session/thread persistence -----------------------------------------
+# Where the SQLite thread store lives. Override via env; use ":memory:" for a
+# transient in-process DB (handy for tests). Defaults to a file next to the
+# source tree so threads survive server restarts.
+THREAD_DB_PATH: str = os.getenv(
+    "THREAD_DB_PATH", str(Path(__file__).resolve().parent / "threads.db")
+)

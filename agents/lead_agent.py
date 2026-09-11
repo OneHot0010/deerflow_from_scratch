@@ -1,15 +1,20 @@
-"""Lead agent — tool-calling ReAct form (P1) + streaming ReAct (P2).
+"""Lead agent — tool-calling ReAct (P1) + streaming (P2) + thread history (P3).
 
 Grows DeerFlow's `agents/lead_agent` from the P0 single-turn responder into a
 multi-turn ReAct loop:
 
     Reason -> (optional) Act via a tool -> Observe result -> Reason -> ... -> Answer
 
-Two public entry points:
-- `run(question)`        -> P1: run the loop and return the final answer text.
-- `run_stream(question)` -> P2: run the loop as a generator, yielding structured
-                            events (content deltas + tool activity) so the web
-                            layer can forward them over Server-Sent Events.
+Public entry points:
+- `run(question, history=None)`        -> P1: run the loop, return final text.
+- `run_stream(question, history=None)` -> P2: run the loop as a generator of
+                                          structured events for Server-Sent Events.
+
+P3 (会话持久化) adds an optional `history` argument to both: prior messages from
+a persisted thread seed the conversation instead of always starting fresh from
+[system, user]. After either method finishes, the full working conversation is
+available on `self.messages`, so the web layer can save it back to the thread
+store. The SSE event protocol is unchanged.
 
 Flow each iteration:
 1. Send the running conversation + tool schemas to the LLM.
@@ -42,11 +47,13 @@ DEFAULT_MAX_STEPS = 10
 
 
 class LeadAgent:
-    """Multi-turn, tool-using agent (P1 blocking + P2 streaming).
+    """Multi-turn, tool-using agent (P1 blocking + P2 streaming + P3 history).
 
     Kept as a class so later phases can attach memory / sub-agents without
     changing the call site. `run(question)` returns the final answer text;
-    `run_stream(question)` yields events for the SSE server.
+    `run_stream(question)` yields events for the SSE server. Both accept an
+    optional `history` of prior messages (P3) and leave the full updated
+    conversation on `self.messages` for the caller to persist.
     """
 
     def __init__(
@@ -64,17 +71,46 @@ class LeadAgent:
         # Optional observability hook: on_event(kind, payload). Used by the CLI
         # to show tool activity. Never affects control flow.
         self.on_event = on_event
+        # The working conversation of the most recent run/run_stream call. After
+        # a run finishes this holds [system, ...history..., user, ...loop...] so
+        # the web layer (P3) can persist it back to the thread store.
+        self.messages: list[dict[str, Any]] = []
 
-    # -- public API: blocking (P1) ------------------------------------------
-    def run(self, question: str) -> str:
-        """Take one user question, drive the ReAct loop, return the answer."""
+    # -- conversation seeding (P3) ------------------------------------------
+    def _seed_messages(
+        self, question: str, history: list[dict[str, Any]] | None
+    ) -> list[dict[str, Any]]:
+        """Build the starting conversation for a run.
+
+        With no `history`, this is the classic [system, user] pair. With a
+        persisted `history` (P3), we reuse it verbatim — ensuring exactly one
+        leading system prompt — and append the new user turn. This lets a thread
+        resume where it left off, tool_calls and all.
+        """
+        if not history:
+            return [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": question},
+            ]
+
+        seeded = list(history)
+        if not seeded or seeded[0].get("role") != "system":
+            seeded.insert(0, {"role": "system", "content": self.system_prompt})
+        seeded.append({"role": "user", "content": question})
+        return seeded
+
+    # -- public API: blocking (P1, + P3 history) ----------------------------
+    def run(self, question: str, history: list[dict[str, Any]] | None = None) -> str:
+        """Take one user question, drive the ReAct loop, return the answer.
+
+        `history` (P3) optionally seeds the conversation with a thread's prior
+        messages. The full updated conversation is left on `self.messages`.
+        """
         if not question or not question.strip():
             raise ValueError("question must be a non-empty string")
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": question},
-        ]
+        messages = self._seed_messages(question, history)
+        self.messages = messages
 
         for _ in range(self.max_steps):
             message = llm.chat(messages, tools=self._tool_schemas or None)
@@ -82,6 +118,9 @@ class LeadAgent:
 
             # No tool calls -> this is the final answer.
             if not tool_calls:
+                messages.append(
+                    {"role": "assistant", "content": message.content or ""}
+                )
                 return message.content or ""
 
             # Record the assistant's tool-call turn verbatim, then execute.
@@ -92,10 +131,14 @@ class LeadAgent:
         # Exhausted the step budget: make one last plain call for a wrap-up.
         self._emit("max_steps_reached", {"max_steps": self.max_steps})
         final = llm.chat(messages)  # no tools -> force a textual answer
-        return final.content or "[agent] stopped: reached max tool-call steps."
+        content = final.content or "[agent] stopped: reached max tool-call steps."
+        messages.append({"role": "assistant", "content": content})
+        return content
 
-    # -- public API: streaming (P2) -----------------------------------------
-    def run_stream(self, question: str) -> Iterator[dict[str, Any]]:
+    # -- public API: streaming (P2, + P3 history) ---------------------------
+    def run_stream(
+        self, question: str, history: list[dict[str, Any]] | None = None
+    ) -> Iterator[dict[str, Any]]:
         """Drive the ReAct loop as a generator of structured events.
 
         Yields dicts with a `type` field the web layer maps 1:1 onto SSE
@@ -108,17 +151,17 @@ class LeadAgent:
         - {"type": "final",      "content": str}   terminal answer text
         - {"type": "error",      "message": str}   terminal error
 
-        The same `on_event` observability hook fires for tool activity, so the
-        CLI tracer keeps working unchanged.
+        `history` (P3) optionally seeds the conversation with a thread's prior
+        messages; after the stream is drained the full updated conversation is
+        available on `self.messages`. The same `on_event` observability hook
+        fires for tool activity, so the CLI tracer keeps working unchanged.
         """
         if not question or not question.strip():
             yield {"type": "error", "message": "question must be a non-empty string"}
             return
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": question},
-        ]
+        messages = self._seed_messages(question, history)
+        self.messages = messages
 
         try:
             for _ in range(self.max_steps):
@@ -143,7 +186,9 @@ class LeadAgent:
 
                 # No tool calls this turn -> the streamed text was the answer.
                 if not tool_calls_acc:
-                    yield {"type": "final", "content": "".join(content_parts)}
+                    answer = "".join(content_parts)
+                    messages.append({"role": "assistant", "content": answer})
+                    yield {"type": "final", "content": answer}
                     return
 
                 # Otherwise: record the assistant turn, run each tool, loop.
@@ -190,11 +235,12 @@ class LeadAgent:
                 if text:
                     final_parts.append(text)
                     yield {"type": "message_chunk", "delta": text}
-            yield {
-                "type": "final",
-                "content": "".join(final_parts)
-                or "[agent] stopped: reached max tool-call steps.",
-            }
+            content = (
+                "".join(final_parts)
+                or "[agent] stopped: reached max tool-call steps."
+            )
+            messages.append({"role": "assistant", "content": content})
+            yield {"type": "final", "content": content}
         except Exception as e:  # never leak a raw traceback to the SSE client
             yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
 

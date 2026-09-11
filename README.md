@@ -4,24 +4,26 @@
 
 模型调用统一走火山方舟(Volcengine Ark) SDK，参考自 `call_llm.py`（Chat）与 `embedding_model.py`（Embedding）。
 
-## 当前阶段：P2 · Web/SSE
+## 当前阶段：P3 · 会话持久化
 
 | 项 | 内容 |
 |---|---|
-| 目标产物 | 把工具调用 Agent 通过 HTTP 暴露，支持 token 级 SSE 流式输出 |
-| 对标模块 | DeerFlow `POST /stream` + `text/event-stream`（gateway runs 雏形） |
-| 核心功能点 | 1) `llm.stream_chat()` 流式调用  2) `LeadAgent.run_stream()` 流式 ReAct 循环  3) FastAPI 三个端点  4) SSE 事件协议 |
-| 验收标准 | `curl -N` 请求 `/chat/stream` 可逐 token 看到回答，并实时看到 tool_start / tool_end 事件 |
+| 目标产物 | 给无状态 Web 层加上 **thread（会话）** 存储：对话可保存、可列出、可续聊 |
+| 对标模块 | DeerFlow 的 thread 模型 + checkpointer（`/api/threads` CRUD + 断点续聊） |
+| 核心功能点 | 1) `store.ThreadStore` —— stdlib `sqlite3` 单表持久化  2) `LeadAgent.run/run_stream` 支持 `history=` 续聊，并把完整对话留在 `self.messages`  3) `/chat`·`/chat/stream` 接受可选 `thread_id`，跑完自动回存  4) `/threads` 增删查列四个端点 |
+| 验收标准 | 带同一 `thread_id` 连续两次 `/chat`，第二次能读到第一次的上下文；`GET /threads/{id}` 能拿回完整消息历史；进程重启后 thread 仍在 |
 
-> 说明：为保持每阶段“最小可运行”，本阶段的 Web 层是无状态的（不落会话）；
-> 会话持久化 / thread 存储留到 P3。
+> 说明：延续每阶段“最小可运行、零新依赖”的原则，持久化只用标准库 `sqlite3`
+> （不引入 SQLAlchemy / LangGraph checkpointer）。每个 thread 的消息历史以一条
+> JSON blob 存一行，schema 极简且 `tool_calls` 无损往返。
 
 ### SSE 事件协议
 
-`POST /chat/stream` 返回 `text/event-stream`，每个帧的 `event:` 名与 agent 事件一一对应，`data:` 为 JSON：
+`POST /chat/stream` 返回 `text/event-stream`，首帧为 `thread_id`（告知客户端本轮所属会话），其后每个帧的 `event:` 名与 agent 事件一一对应，`data:` 为 JSON：
 
 | event | data 字段 | 含义 |
 |---|---|---|
+| `thread_id` | `{thread_id}` | 本轮对话所属 thread（首帧，P3 新增） |
 | `message_chunk` | `{delta}` | 一段增量回答文本 |
 | `tool_start` | `{name, arguments}` | 开始调用某工具 |
 | `tool_end` | `{name, result}` | 工具返回结果 |
@@ -49,6 +51,21 @@ curl -X POST localhost:8000/chat \\
 curl -N -X POST localhost:8000/chat/stream \\
      -H 'content-type: application/json' \\
      -d '{"question": "用 bash 执行 echo hi 并告诉我结果"}'
+
+# P3 · 会话续聊：第一次拿到 thread_id，第二次带上它即可续接上下文
+curl -X POST localhost:8000/chat \\
+     -H 'content-type: application/json' \\
+     -d '{"question": "我叫小明"}'
+# -> {"content": "...", "thread_id": "<TID>"}
+curl -X POST localhost:8000/chat \\
+     -H 'content-type: application/json' \\
+     -d '{"question": "我叫什么？", "thread_id": "<TID>"}'
+
+# P3 · thread 管理
+curl -X POST localhost:8000/threads -H 'content-type: application/json' -d '{"title":"我的会话"}'
+curl localhost:8000/threads                 # 列出全部会话（按最近活跃排序）
+curl localhost:8000/threads/<TID>           # 取回某会话的完整消息历史
+curl -X DELETE localhost:8000/threads/<TID> # 删除会话
 ```
 
 ## 目录结构
@@ -64,8 +81,10 @@ mini-deerflow/
 ├── agents/
 │   ├── __init__.py
 │   └── lead_agent.py    # LeadAgent：多轮 ReAct 工具调用循环
+├── store.py             # P3 会话持久化：ThreadStore（stdlib sqlite3 单表）
 ├── main.py              # CLI 入口（单发 + 交互，含工具活动 trace）
-├── server.py             # P2 Web 入口：FastAPI + SSE（/health /chat /chat/stream）
+├── server.py             # P3 Web 入口：FastAPI + SSE + thread 端点
+│                        #   /health /chat /chat/stream /threads(CRUD)
 ├── call_llm.py          # 参考文件：Chat 模型调用样例
 ├── embedding_model.py   # 参考文件：Embedding 模型调用样例
 ├── requirements.txt
@@ -107,6 +126,29 @@ python main.py --quiet "列出当前目录的文件"                       # 隐
 4. 循环“推理 → 调用 → 观察”，直到模型给出不含工具调用的最终回答；
    `max_steps`（默认 10）作为防死循环护栏。
 
+## 会话持久化工作机制（P3）
+
+1. **存储层 `store.ThreadStore`**：用标准库 `sqlite3` 建一张 `threads` 表
+   （`id / title / created_at / updated_at / messages`）。每个 thread 的完整消息
+   列表以一条 JSON blob 存于 `messages` 列——thread 体量小，单 blob 让 schema 极简，
+   且 `tool_calls`、`tool` 结果都能无损往返。
+2. **Agent 续聊**：`LeadAgent.run()` / `run_stream()` 新增可选 `history=` 入参。
+   传入某 thread 的历史消息后，会话从历史续接（而非每次都从 `[system, user]` 重开）；
+   跑完后完整对话留在 `self.messages`，供 Web 层回存。
+3. **Web 层收口**：`/chat`、`/chat/stream` 接受可选 `thread_id`——
+   - 命中已有 thread → 载入历史喂给 agent；
+   - 缺省 / 未知 id → 视为一个新 thread。
+   一轮跑完（非报错）后，把 `agent.messages` 整体 `save_messages()` 回存，并把
+   `thread_id` 回传给客户端（`/chat` 在响应体、`/chat/stream` 作为 SSE 首帧）。
+4. **thread 管理**：`POST /threads` 建、`GET /threads` 列（按最近活跃排序，不带消息体）、
+   `GET /threads/{id}` 取（带完整历史）、`DELETE /threads/{id}` 删。
+5. **进程级默认 store**：`get_store()` 懒加载一个文件级默认实例（路径由
+   `config.THREAD_DB_PATH` 决定，可用 `:memory:`）；`set_store()` 便于测试注入。
+
+> 与 DeerFlow 的对齐点：thread 即会话单元，历史可载入续聊、可列出、可删除——
+> 这是后续 P4 中间件链、P12 长任务续跑的基础。差别在于我们不引入 checkpointer /
+> 分支（branch）等重型能力，只落最小可用的“存 + 读 + 续”。
+
 ## 设计说明
 
 - **密钥不落地**：统一从环境变量 / `.env` 读取（`config.py`），源码不含密钥。
@@ -133,9 +175,12 @@ python -m pytest tests/test_p2_server.py -v   # 单文件
 | `tests/test_p1_agent.py` | P1 | 阻塞 ReAct 循环：直接回答、工具回合、未知工具、max_steps 护栏 | 7 |
 | `tests/test_p2_agent_stream.py` | P2 | `run_stream` 事件序列、tool_call 分片重组、异常转 error | 9 |
 | `tests/test_p2_server.py` | P2 | `/health` `/chat` `/chat/stream` SSE 帧、事件名、done、参数校验 | 8 |
+| `tests/test_p3_store.py` | P3 | `ThreadStore` 增删查列、标题派生、`tool_calls` 无损往返、默认 store 访问器 | 10 |
+| `tests/test_p3_server.py` | P3 | `/threads` CRUD、`/chat` 续聊与回存、SSE 首帧 `thread_id`、出错不落库 | 9 |
 
-共 **64** 个用例。服务层测试用 FastAPI `TestClient`（进程内 ASGI），不绑定端口。
+共 **83** 个用例。服务层测试用 FastAPI `TestClient`（进程内 ASGI），不绑定端口；
+P3 测试通过 autouse fixture 注入 `:memory:` 版 `ThreadStore`，全程离线、不落磁盘。
 
 ## 路线图（后续阶段）
 
-P3 会话持久化 → P4 中间件链 → P5 沙箱 → P6 多模型工厂 → P7 MCP → P8 技能系统 → P9 子智能体 → P10 架构分层 → P11 IM 渠道 → P12 定时/长任务 → P13 生产加固。
+~~P3 会话持久化~~（本阶段完成）→ P4 中间件链 → P5 沙箱 → P6 多模型工厂 → P7 MCP → P8 技能系统 → P9 子智能体 → P10 架构分层 → P11 IM 渠道 → P12 定时/长任务 → P13 生产加固。

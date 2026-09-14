@@ -4,18 +4,18 @@
 
 模型调用统一走火山方舟(Volcengine Ark) SDK，参考自 `call_llm.py`（Chat）与 `embedding_model.py`（Embedding）。
 
-## 当前阶段：P3 · 会话持久化
+## 当前阶段：P4 · 中间件链
 
 | 项 | 内容 |
 |---|---|
-| 目标产物 | 给无状态 Web 层加上 **thread（会话）** 存储：对话可保存、可列出、可续聊 |
-| 对标模块 | DeerFlow 的 thread 模型 + checkpointer（`/api/threads` CRUD + 断点续聊） |
-| 核心功能点 | 1) `store.ThreadStore` —— stdlib `sqlite3` 单表持久化  2) `LeadAgent.run/run_stream` 支持 `history=` 续聊，并把完整对话留在 `self.messages`  3) `/chat`·`/chat/stream` 接受可选 `thread_id`，跑完自动回存  4) `/threads` 增删查列四个端点 |
-| 验收标准 | 带同一 `thread_id` 连续两次 `/chat`，第二次能读到第一次的上下文；`GET /threads/{id}` 能拿回完整消息历史；进程重启后 thread 仍在 |
+| 目标产物 | 给每次 run 套上一条 **中间件链（MiddlewareChain）**：在固定生命周期钩子上插入可插拔行为 |
+| 对标模块 | DeerFlow 的 middleware 体系（Summarization / Title / TodoList 等 AgentMiddleware） |
+| 核心功能点 | 1) 中间件注册机制 + 责任链按序执行  2) `before_agent/before_model/after_model/after_agent` 四个生命周期钩子  3) `SummarizationMiddleware` 超长上下文自动压缩  4) `TitleMiddleware` 标题自动生成 + `TodoListMiddleware` 任务跟踪 |
+| 验收标准 | 中间件按注册序执行（`after_*` 逆序）、单个钩子抛错被隔离不影响其余；上下文超预算时自动压缩且不孤立 `tool` 结果；首轮对话后自动派生 thread 标题 |
 
-> 说明：延续每阶段“最小可运行、零新依赖”的原则，持久化只用标准库 `sqlite3`
-> （不引入 SQLAlchemy / LangGraph checkpointer）。每个 thread 的消息历史以一条
-> JSON blob 存一行，schema 极简且 `tool_calls` 无损往返。
+> 说明：延续“最小可运行、零新依赖”的原则。链默认为空（无 factory 时），
+> 故 P0–P3 行为与其离线测试逐字节不变；每次 run 由 `middleware_factory` 现造一条
+> 新链，让 TodoList/Title 等持有的“每轮状态”不跨会话串味。
 
 ### SSE 事件协议
 
@@ -29,8 +29,9 @@
 | `tool_end` | `{name, result}` | 工具返回结果 |
 | `max_steps` | `{max_steps}` | 触发步数护栏 |
 | `final` | `{content}` | 最终回答文本 |
+| `title` / `context_compressed` | 由中间件决定 | 中间件透传的结构化事件（P4，穿插于标准事件之间） |
 | `error` | `{message}` | 出错终止 |
-| `done` | `{}` | 流正常结束标志 |
+| `done` | `{title, todos}` | 流正常结束标志（P4 携带派生标题与任务清单） |
 
 ### 运行 Web 服务
 
@@ -80,8 +81,9 @@ mini-deerflow/
 │   └── builtins.py      # 内置工具：bash / read_file / write_file
 ├── agents/
 │   ├── __init__.py
-│   └── lead_agent.py    # LeadAgent：多轮 ReAct 工具调用循环
-├── store.py             # P3 会话持久化：ThreadStore（stdlib sqlite3 单表）
+│   ├── lead_agent.py    # LeadAgent：多轮 ReAct 循环 + P4 中间件链接入
+│   └── middlewares/     # P4 中间件：base(链+上下文) / summarization / title / todo
+├── store.py             # P3 会话持久化：ThreadStore（stdlib sqlite3 单表）+ P4 set_title
 ├── main.py              # CLI 入口（单发 + 交互，含工具活动 trace）
 ├── server.py             # P3 Web 入口：FastAPI + SSE + thread 端点
 │                        #   /health /chat /chat/stream /threads(CRUD)
@@ -149,6 +151,18 @@ python main.py --quiet "列出当前目录的文件"                       # 隐
 > 这是后续 P4 中间件链、P12 长任务续跑的基础。差别在于我们不引入 checkpointer /
 > 分支（branch）等重型能力，只落最小可用的“存 + 读 + 续”。
 
+## 中间件链工作机制（P4）
+
+1. **责任链 `MiddlewareChain`**：按注册顺序持有一组 `Middleware`。`before_*` 钩子正序执行、`after_*` 逆序执行（像上下文管理器一样嵌套）；任一钩子抛错都会被**隔离**并记到 `ctx.scratch["_errors"]`，绝不打断其余中间件或主循环。
+2. **四个生命周期钩子**：`before_agent`（每轮一次，播种会话后，可注入工具 / 改写系统提示——之后重新快照工具 schema，使 `write_todos` 之类注入工具可见）、`before_model`（每次模型调用前，可改写待发送消息，如摘要压缩）、`after_model`（每次回复后）、`after_agent`（每轮一次，收尾派生标题 / 任务清单）。
+3. **每轮现造新链**：`LeadAgent(middleware_factory=...)` 每次 run 用工厂造一条**全新**链，使 TodoList/Title 的每轮状态不跨会话串味；默认 `middleware_factory=None` → 空链，P0–P3 行为不变。
+4. **内置三件套**（`default_middlewares()`，顺序 Title → Summarization → TodoList）：
+   - `SummarizationMiddleware`：以 `~len/4` 估算 token，超 `max_tokens` 时保留头部系统提示 + 末尾 `keep_last` 条，中间折叠成一条 `[conversation-summary]` 系统消息；切点自动前移，绝不把 `tool` 结果与其配对的 `assistant tool_calls` 拆散。
+   - `TitleMiddleware`：首轮 `after_agent` 用一次 `llm.chat_completion` 生成 ≤8 词标题，失败则回退为首条用户消息前缀；已有历史（续聊）则跳过。
+   - `TodoListMiddleware`：注入 `write_todos` 工具，`before_model` 把当前计划以 `[todo-list]` 临时系统消息挂到模型面前（每轮先删再挂、不堆叠），`after_agent` 剥离该提醒并把计划落到 `ctx.todos`。
+5. **事件透传**：中间件 `ctx.emit(...)` 的结构化事件——阻塞路径转发给 `on_event`，流式路径作为 SSE 帧穿插在标准事件间；派生的 `title` / `todos` 落到 `agent.title` / `agent.todos`，Web 层据此回存（`store.set_title` 覆盖派生标题）并在 `/chat` 响应体、`/chat/stream` 的 `done` 帧回传。
+
+
 ## 设计说明
 
 - **密钥不落地**：统一从环境变量 / `.env` 读取（`config.py`），源码不含密钥。
@@ -159,7 +173,7 @@ python main.py --quiet "列出当前目录的文件"                       # 隐
 
 ## 测试
 
-P0–P2 全量单测 + SSE 集成测试，**完全离线**：mock 掉 `llm` 层与 Ark 客户端，不会发起任何网络 / 模型调用，也无需 `ARK_API_KEY`。
+P0–P4 全量单测 + SSE 集成测试，**完全离线**：mock 掉 `llm` 层与 Ark 客户端，不会发起任何网络 / 模型调用，也无需 `ARK_API_KEY`。
 
 ```bash
 pip install -r requirements.txt   # 含 pytest
@@ -177,10 +191,11 @@ python -m pytest tests/test_p2_server.py -v   # 单文件
 | `tests/test_p2_server.py` | P2 | `/health` `/chat` `/chat/stream` SSE 帧、事件名、done、参数校验 | 8 |
 | `tests/test_p3_store.py` | P3 | `ThreadStore` 增删查列、标题派生、`tool_calls` 无损往返、默认 store 访问器 | 10 |
 | `tests/test_p3_server.py` | P3 | `/threads` CRUD、`/chat` 续聊与回存、SSE 首帧 `thread_id`、出错不落库 | 9 |
+| `tests/test_p4_middlewares.py` | P4 | 链按序执行/`after_*`逆序、抛错隔离、生命周期钩子计数与事件透传、Title/TodoList/Summarization 行为、`default_middlewares` 顺序 | 15 |
 
-共 **83** 个用例。服务层测试用 FastAPI `TestClient`（进程内 ASGI），不绑定端口；
+共 **98** 个用例。服务层测试用 FastAPI `TestClient`（进程内 ASGI），不绑定端口；
 P3 测试通过 autouse fixture 注入 `:memory:` 版 `ThreadStore`，全程离线、不落磁盘。
 
 ## 路线图（后续阶段）
 
-~~P3 会话持久化~~（本阶段完成）→ P4 中间件链 → P5 沙箱 → P6 多模型工厂 → P7 MCP → P8 技能系统 → P9 子智能体 → P10 架构分层 → P11 IM 渠道 → P12 定时/长任务 → P13 生产加固。
+~~P3 会话持久化~~ → ~~P4 中间件链~~（本阶段完成）→ P5 沙箱 → P6 多模型工厂 → P7 MCP → P8 技能系统 → P9 子智能体 → P10 架构分层 → P11 IM 渠道 → P12 定时/长任务 → P13 生产加固。

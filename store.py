@@ -193,6 +193,24 @@ class ThreadStore:
             "message_count": len(messages),
         }
 
+    def set_title(self, thread_id: str, title: str) -> bool:
+        """Set a thread's title explicitly (used by TitleMiddleware, P4).
+
+        Overwrites whatever title the thread currently has. Returns True if a
+        row was updated. Unlike ``save_messages``' fallback derivation, this is
+        the authoritative title the middleware computed for the conversation.
+        """
+        title = (title or "").strip()
+        if not title:
+            return False
+        now = _now_iso()
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
+                (title, now, thread_id),
+            )
+        return cur.rowcount > 0
+
     def delete_thread(self, thread_id: str) -> bool:
         """Delete a thread. Returns True if a row was removed."""
         with self._lock, self._conn:

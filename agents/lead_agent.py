@@ -1,4 +1,5 @@
-"""Lead agent — tool-calling ReAct (P1) + streaming (P2) + thread history (P3).
+"""Lead agent — tool-calling ReAct (P1) + streaming (P2) + thread history (P3)
++ middleware chain (P4).
 
 Grows DeerFlow's `agents/lead_agent` from the P0 single-turn responder into a
 multi-turn ReAct loop:
@@ -16,6 +17,26 @@ a persisted thread seed the conversation instead of always starting fresh from
 available on `self.messages`, so the web layer can save it back to the thread
 store. The SSE event protocol is unchanged.
 
+P4 (中间件链) wraps every run in a `MiddlewareChain`. The agent accepts an
+optional `middleware_factory` that returns a *fresh* chain per run (middlewares
+like TodoList hold per-run state, so they must not be shared across runs). The
+lifecycle hooks fire at fixed points:
+
+    before_agent   once, after seeding the conversation (may inject tools /
+                   edit the system prompt) — tool schemas are (re)snapshotted
+                   afterwards so injected tools like `write_todos` are visible.
+    before_model   before every model call (may rewrite the working messages,
+                   e.g. summarization compresses an over-long context).
+    after_model    after every model reply (inspect / annotate).
+    after_agent    once, after the loop yields a final answer (derive outputs
+                   such as the thread title and the final todo list).
+
+The default `middleware_factory` is `None`, which yields an *empty* chain, so
+P0-P3 behaviour (and their offline tests) is byte-for-byte unchanged. Structured
+events middlewares emit (`ctx.emit(...)`) are forwarded: to `on_event` in the
+blocking path and as SSE dicts in the streaming path. Derived outputs land on
+`self.title` / `self.todos` for the web layer to persist / surface.
+
 Flow each iteration:
 1. Send the running conversation + tool schemas to the LLM.
 2. If the model returns `tool_calls`, execute each locally and append the
@@ -30,6 +51,7 @@ from __future__ import annotations
 from typing import Any, Callable, Iterator
 
 import llm
+from agents.middlewares import AgentContext, Middleware, MiddlewareChain
 from tools import Tool, get_available_tools, tools_by_name
 
 SYSTEM_PROMPT = (
@@ -45,15 +67,24 @@ SYSTEM_PROMPT = (
 # confused model can never loop forever.
 DEFAULT_MAX_STEPS = 10
 
+# A middleware factory returns a fresh chain (or a list of middlewares) per run.
+MiddlewareFactory = Callable[[], "MiddlewareChain | list[Middleware]"]
+
 
 class LeadAgent:
-    """Multi-turn, tool-using agent (P1 blocking + P2 streaming + P3 history).
+    """Multi-turn, tool-using agent (P1 blocking + P2 streaming + P3 history +
+    P4 middleware chain).
 
     Kept as a class so later phases can attach memory / sub-agents without
     changing the call site. `run(question)` returns the final answer text;
     `run_stream(question)` yields events for the SSE server. Both accept an
     optional `history` of prior messages (P3) and leave the full updated
     conversation on `self.messages` for the caller to persist.
+
+    `middleware_factory` (P4) is called once per run to build a fresh
+    `MiddlewareChain`; the default (`None`) yields an empty chain so earlier
+    phases behave identically. Derived outputs land on `self.title` /
+    `self.todos` after a run.
     """
 
     def __init__(
@@ -62,6 +93,7 @@ class LeadAgent:
         tools: list[Tool] | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
+        middleware_factory: MiddlewareFactory | None = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.tools = get_available_tools() if tools is None else tools
@@ -71,10 +103,47 @@ class LeadAgent:
         # Optional observability hook: on_event(kind, payload). Used by the CLI
         # to show tool activity. Never affects control flow.
         self.on_event = on_event
+        # P4: builds a fresh middleware chain per run (fresh instances so
+        # per-run state like TodoList's plan never bleeds across conversations).
+        self._middleware_factory = middleware_factory
         # The working conversation of the most recent run/run_stream call. After
         # a run finishes this holds [system, ...history..., user, ...loop...] so
         # the web layer (P3) can persist it back to the thread store.
         self.messages: list[dict[str, Any]] = []
+        # P4 derived outputs (set by middlewares such as Title / TodoList).
+        self.title: str | None = None
+        self.todos: list[dict[str, Any]] = []
+
+    # -- middleware plumbing (P4) -------------------------------------------
+    def _make_chain(self) -> MiddlewareChain:
+        """Build a fresh chain for this run (empty when no factory is set)."""
+        if self._middleware_factory is None:
+            return MiddlewareChain()
+        chain = self._middleware_factory()
+        if isinstance(chain, MiddlewareChain):
+            return chain
+        # Convenience: a factory may just return a list of middlewares.
+        return MiddlewareChain(list(chain))
+
+    def _drain_events(self, ctx: AgentContext) -> None:
+        """Forward queued middleware events to `on_event` (blocking path)."""
+        events, ctx.events = ctx.events, []
+        for ev in events:
+            kind = ev.get("type", "event")
+            self._emit(kind, {k: v for k, v in ev.items() if k != "type"})
+
+    @staticmethod
+    def _iter_events(ctx: AgentContext) -> Iterator[dict[str, Any]]:
+        """Yield queued middleware events as SSE dicts (streaming path)."""
+        events, ctx.events = ctx.events, []
+        for ev in events:
+            yield dict(ev)
+
+    def _record_outputs(self, ctx: AgentContext) -> None:
+        """Copy the final working conversation + derived outputs off the ctx."""
+        self.messages = ctx.messages
+        self.title = ctx.title
+        self.todos = list(ctx.todos)
 
     # -- conversation seeding (P3) ------------------------------------------
     def _seed_messages(
@@ -99,12 +168,13 @@ class LeadAgent:
         seeded.append({"role": "user", "content": question})
         return seeded
 
-    # -- public API: blocking (P1, + P3 history) ----------------------------
+    # -- public API: blocking (P1, + P3 history, + P4 middleware) -----------
     def run(self, question: str, history: list[dict[str, Any]] | None = None) -> str:
         """Take one user question, drive the ReAct loop, return the answer.
 
         `history` (P3) optionally seeds the conversation with a thread's prior
         messages. The full updated conversation is left on `self.messages`.
+        A fresh middleware chain (P4) wraps the run when a factory is set.
         """
         if not question or not question.strip():
             raise ValueError("question must be a non-empty string")
@@ -112,30 +182,54 @@ class LeadAgent:
         messages = self._seed_messages(question, history)
         self.messages = messages
 
-        for _ in range(self.max_steps):
-            message = llm.chat(messages, tools=self._tool_schemas or None)
+        chain = self._make_chain()
+        ctx = AgentContext(
+            messages=messages, tools=list(self.tools), question=question
+        )
+        chain.before_agent(ctx)
+        self._drain_events(ctx)
+        # before_agent may have injected tools / edited the system prompt; take
+        # a fresh snapshot so injected tools (e.g. write_todos) are visible.
+        tool_index = tools_by_name(ctx.tools)
+        tool_schemas = [t.to_openai_schema() for t in ctx.tools]
+        messages = ctx.messages
+
+        for step in range(self.max_steps):
+            ctx.step = step
+            chain.before_model(ctx)
+            self._drain_events(ctx)
+            messages = ctx.messages  # before_model may have rewritten it
+
+            message = llm.chat(messages, tools=tool_schemas or None)
+            chain.after_model(ctx)
+            self._drain_events(ctx)
             tool_calls = getattr(message, "tool_calls", None)
 
             # No tool calls -> this is the final answer.
             if not tool_calls:
-                messages.append(
-                    {"role": "assistant", "content": message.content or ""}
-                )
-                return message.content or ""
+                content = message.content or ""
+                messages.append({"role": "assistant", "content": content})
+                chain.after_agent(ctx)
+                self._drain_events(ctx)
+                self._record_outputs(ctx)
+                return content
 
             # Record the assistant's tool-call turn verbatim, then execute.
             messages.append(_assistant_message_to_dict(message))
             for call in tool_calls:
-                messages.append(self._execute_tool_call(call))
+                messages.append(self._execute_tool_call(call, tool_index))
 
         # Exhausted the step budget: make one last plain call for a wrap-up.
         self._emit("max_steps_reached", {"max_steps": self.max_steps})
         final = llm.chat(messages)  # no tools -> force a textual answer
         content = final.content or "[agent] stopped: reached max tool-call steps."
         messages.append({"role": "assistant", "content": content})
+        chain.after_agent(ctx)
+        self._drain_events(ctx)
+        self._record_outputs(ctx)
         return content
 
-    # -- public API: streaming (P2, + P3 history) ---------------------------
+    # -- public API: streaming (P2, + P3 history, + P4 middleware) ----------
     def run_stream(
         self, question: str, history: list[dict[str, Any]] | None = None
     ) -> Iterator[dict[str, Any]]:
@@ -151,6 +245,9 @@ class LeadAgent:
         - {"type": "final",      "content": str}   terminal answer text
         - {"type": "error",      "message": str}   terminal error
 
+        Middlewares (P4) may emit extra structured events (e.g. `title`,
+        `context_compressed`), forwarded verbatim between the standard ones.
+
         `history` (P3) optionally seeds the conversation with a thread's prior
         messages; after the stream is drained the full updated conversation is
         available on `self.messages`. The same `on_event` observability hook
@@ -163,14 +260,29 @@ class LeadAgent:
         messages = self._seed_messages(question, history)
         self.messages = messages
 
+        chain = self._make_chain()
+        ctx = AgentContext(
+            messages=messages, tools=list(self.tools), question=question
+        )
         try:
-            for _ in range(self.max_steps):
+            chain.before_agent(ctx)
+            yield from self._iter_events(ctx)
+            tool_index = tools_by_name(ctx.tools)
+            tool_schemas = [t.to_openai_schema() for t in ctx.tools]
+            messages = ctx.messages
+
+            for step in range(self.max_steps):
+                ctx.step = step
+                chain.before_model(ctx)
+                yield from self._iter_events(ctx)
+                messages = ctx.messages  # before_model may have rewritten it
+
                 # Stream one model turn, forwarding text deltas as they arrive
                 # while reassembling the full message (content + tool_calls).
                 content_parts: list[str] = []
                 tool_calls_acc: dict[int, dict[str, Any]] = {}
 
-                for chunk in llm.stream_chat(messages, tools=self._tool_schemas or None):
+                for chunk in llm.stream_chat(messages, tools=tool_schemas or None):
                     choices = getattr(chunk, "choices", None)
                     if not choices:
                         continue
@@ -184,10 +296,16 @@ class LeadAgent:
                     for tc in getattr(delta, "tool_calls", None) or []:
                         _merge_tool_call_delta(tool_calls_acc, tc)
 
+                chain.after_model(ctx)
+                yield from self._iter_events(ctx)
+
                 # No tool calls this turn -> the streamed text was the answer.
                 if not tool_calls_acc:
                     answer = "".join(content_parts)
                     messages.append({"role": "assistant", "content": answer})
+                    chain.after_agent(ctx)
+                    self._record_outputs(ctx)
+                    yield from self._iter_events(ctx)
                     yield {"type": "final", "content": answer}
                     return
 
@@ -206,7 +324,7 @@ class LeadAgent:
                     self._emit("tool_start", {"name": name, "arguments": raw_args})
                     yield {"type": "tool_start", "name": name, "arguments": raw_args}
 
-                    tool = self._tool_index.get(name)
+                    tool = tool_index.get(name)
                     result = (
                         f"[tool-error] unknown tool: {name}"
                         if tool is None
@@ -240,18 +358,24 @@ class LeadAgent:
                 or "[agent] stopped: reached max tool-call steps."
             )
             messages.append({"role": "assistant", "content": content})
+            chain.after_agent(ctx)
+            self._record_outputs(ctx)
+            yield from self._iter_events(ctx)
             yield {"type": "final", "content": content}
         except Exception as e:  # never leak a raw traceback to the SSE client
             yield {"type": "error", "message": f"{type(e).__name__}: {e}"}
 
     # -- internals -----------------------------------------------------------
-    def _execute_tool_call(self, call: Any) -> dict[str, Any]:
+    def _execute_tool_call(
+        self, call: Any, tool_index: dict[str, Tool] | None = None
+    ) -> dict[str, Any]:
         """Run a single tool call and return its `tool` result message."""
+        index = self._tool_index if tool_index is None else tool_index
         name = call.function.name
         raw_args = call.function.arguments
         self._emit("tool_start", {"name": name, "arguments": raw_args})
 
-        tool = self._tool_index.get(name)
+        tool = index.get(name)
         if tool is None:
             result = f"[tool-error] unknown tool: {name}"
         else:

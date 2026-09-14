@@ -42,9 +42,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agents.lead_agent import LeadAgent
+from agents.middlewares import default_middlewares
 from store import get_store
 
-app = FastAPI(title="mini-deerflow", version="0.3.0 (P3)")
+app = FastAPI(title="mini-deerflow", version="0.4.0 (P4)")
 
 
 # --- request / response models ----------------------------------------------
@@ -72,9 +73,16 @@ class CreateThreadRequest(BaseModel):
 
 # --- helpers -----------------------------------------------------------------
 def _build_agent(req: ChatRequest) -> LeadAgent:
+    """Build a lead agent wired with the full P4 middleware stack.
+
+    A factory (not a shared chain) is passed so every run gets *fresh*
+    middleware instances — TodoList/Title/Summarization hold per-run state that
+    must not bleed across conversations.
+    """
+    kwargs: dict[str, Any] = {"middleware_factory": default_middlewares}
     if req.max_steps is not None:
-        return LeadAgent(max_steps=req.max_steps)
-    return LeadAgent()
+        kwargs["max_steps"] = req.max_steps
+    return LeadAgent(**kwargs)
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -103,11 +111,11 @@ def _resolve_thread(thread_id: str | None) -> tuple[str, list[dict[str, Any]]]:
 @app.get("/health")
 def health() -> dict[str, str]:
     """Liveness probe."""
-    return {"status": "ok", "phase": "P3"}
+    return {"status": "ok", "phase": "P4"}
 
 
 @app.post("/chat")
-def chat(req: ChatRequest) -> dict[str, str]:
+def chat(req: ChatRequest) -> dict[str, Any]:
     """Blocking variant: run the agent to completion and return the final text.
 
     Loads any prior thread history, runs the ReAct loop, and persists the
@@ -129,8 +137,17 @@ def chat(req: ChatRequest) -> dict[str, str]:
         # Nothing durable to record on a failed turn.
         return {"error": error, "thread_id": thread_id}
 
-    get_store().save_messages(thread_id, agent.messages)
-    return {"content": content, "thread_id": thread_id}
+    store = get_store()
+    store.save_messages(thread_id, agent.messages)
+    # P4: persist the LLM-derived title (TitleMiddleware) over the fallback one.
+    if agent.title:
+        store.set_title(thread_id, agent.title)
+    return {
+        "content": content,
+        "thread_id": thread_id,
+        "title": agent.title,
+        "todos": agent.todos,
+    }
 
 
 @app.post("/chat/stream")
@@ -153,8 +170,11 @@ def chat_stream(req: ChatRequest) -> StreamingResponse:
                 errored = True
             yield _sse(kind, ev)
         if not errored:
-            get_store().save_messages(thread_id, agent.messages)
-        yield _sse("done", {})
+            store = get_store()
+            store.save_messages(thread_id, agent.messages)
+            if agent.title:
+                store.set_title(thread_id, agent.title)
+        yield _sse("done", {"title": agent.title, "todos": agent.todos})
 
     return StreamingResponse(
         event_source(),

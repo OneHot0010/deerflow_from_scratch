@@ -78,7 +78,7 @@ def _parse_sse(text: str):
 
 # --- thread management -------------------------------------------------------
 def test_health_reports_p3(client):
-    assert client.get("/health").json() == {"status": "ok", "phase": "P4"}
+    assert client.get("/health").json() == {"status": "ok", "phase": "P5"}
 
 
 def test_create_list_get_delete_thread(client):

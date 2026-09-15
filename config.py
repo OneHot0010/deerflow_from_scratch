@@ -61,3 +61,24 @@ def require_api_key() -> str:
 THREAD_DB_PATH: str = os.getenv(
     "THREAD_DB_PATH", str(Path(__file__).resolve().parent / "threads.db")
 )
+
+
+# --- P5: sandboxed execution -------------------------------------------------
+# Host directory under which every sandbox's real files live. Each thread (and
+# the generic CLI sandbox) gets an isolated subtree beneath this root, exposed
+# to the agent as the virtual path "/workspace". Override via env; defaults to a
+# ``sandboxes/`` dir next to the source tree.
+SANDBOX_DIR: str = os.getenv(
+    "SANDBOX_DIR", str(Path(__file__).resolve().parent / "sandboxes")
+)
+
+# Whether the built-in bash / read_file / write_file tools execute *inside* the
+# sandbox (P5) instead of directly on the host. Off by default so P0-P4
+# behaviour and their offline tests are byte-for-byte unchanged; the web/CLI
+# layers opt in. Accepts 1/true/yes/on (case-insensitive).
+SANDBOX_ENABLED: bool = os.getenv("SANDBOX_ENABLED", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}

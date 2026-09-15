@@ -57,7 +57,7 @@ def _parse_sse(text: str):
 def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
-    assert r.json() == {"status": "ok", "phase": "P4"}
+    assert r.json() == {"status": "ok", "phase": "P5"}
 
 
 def test_chat_returns_final_content(client, patch_stream):

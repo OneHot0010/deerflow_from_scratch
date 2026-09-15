@@ -4,18 +4,21 @@
 
 模型调用统一走火山方舟(Volcengine Ark) SDK，参考自 `call_llm.py`（Chat）与 `embedding_model.py`（Embedding）。
 
-## 当前阶段：P4 · 中间件链
+## 当前阶段：P5 · 沙箱化执行
 
 | 项 | 内容 |
 |---|---|
-| 目标产物 | 给每次 run 套上一条 **中间件链（MiddlewareChain）**：在固定生命周期钩子上插入可插拔行为 |
-| 对标模块 | DeerFlow 的 middleware 体系（Summarization / Title / TodoList 等 AgentMiddleware） |
-| 核心功能点 | 1) 中间件注册机制 + 责任链按序执行  2) `before_agent/before_model/after_model/after_agent` 四个生命周期钩子  3) `SummarizationMiddleware` 超长上下文自动压缩  4) `TitleMiddleware` 标题自动生成 + `TodoListMiddleware` 任务跟踪 |
-| 验收标准 | 中间件按注册序执行（`after_*` 逆序）、单个钩子抛错被隔离不影响其余；上下文超预算时自动压缩且不孤立 `tool` 结果；首轮对话后自动派生 thread 标题 |
+| 目标产物 | 让工具的命令与文件操作在一个**隔离环境（Sandbox）**内执行：仅认**虚拟路径**（`/workspace/...`），映射到真实主机目录，且**防目录穿越** |
+| 对标模块 | DeerFlow 的 `sandbox/` 模块（`SandboxProvider` 抽象 + `LocalSandbox`） |
+| 核心功能点 | 1) `SandboxProvider` 抽象接口（工厂 + 生命周期 `acquire/get/release/reset`）  2) `LocalSandboxProvider`（开发用本地后端，零新依赖）  3) 虚拟路径映射 `PathMapping`（`/workspace` → 主机目录）  4) 防目录穿越（`realpath` + `commonpath` 容纳性校验，拦 `../`、绝对路径逃逸、软链外指、NUL 字节） |
+| 验收标准 | 工具执行在沙箱内、虚拟路径正确映射、防目录穿越；命令输出与目录列举反向映射回虚拟路径不泄露主机路径；只读映射拒绝写入（`EROFS`） |
 
-> 说明：延续“最小可运行、零新依赖”的原则。链默认为空（无 factory 时），
-> 故 P0–P3 行为与其离线测试逐字节不变；每次 run 由 `middleware_factory` 现造一条
-> 新链，让 TodoList/Title 等持有的“每轮状态”不跨会话串味。
+> 说明：延续“最小可运行、零新依赖”的原则(纯 `os`/`pathlib`/`subprocess`)。沙箱默认**关闭**
+> （`config.SANDBOX_ENABLED` 缺省 False，`get_available_tools(sandbox=None)`），故 P0–P4 行为
+> 与其离线测试逐字节不变；Web/CLI 层显式开启后，`bash`/`read_file`/`write_file` 三工具改为在
+> 沙箱内执行——**工具名与 schema 完全不变**，调用点 `get_available_tools()` 保持稳定。
+> Docker 后端是路线图“关键技术”的远期目标，本阶段只落 `LocalSandboxProvider(开发)`；
+> 抽象已按“换 `DockerSandboxProvider` 不动调用点”的形态预留。
 
 ### SSE 事件协议
 
@@ -73,12 +76,17 @@ curl -X DELETE localhost:8000/threads/<TID> # 删除会话
 
 ```
 mini-deerflow/
-├── config.py            # 环境变量 / .env 读取，API Key 与模型名集中管理
+├── config.py            # 环境变量 / .env 读取，API Key/模型名 + P5 SANDBOX_DIR/SANDBOX_ENABLED
 ├── llm.py               # Ark SDK 封装：chat()(含 tool_calls) / chat_completion() / embed()
 ├── tools/
 │   ├── __init__.py      # get_available_tools() 注册入口（对标 DeerFlow tools/）
 │   ├── base.py          # Tool 抽象：callable + JSON schema + 安全 run()
-│   └── builtins.py      # 内置工具：bash / read_file / write_file
+│   ├── builtins.py      # 内置工具（主机直连）：bash / read_file / write_file
+│   └── sandbox_tools.py # P5 沙箱版三工具：同名同 schema，绑定到 Sandbox（虚拟路径）
+├── sandbox/             # P5 沙箱化执行（对标 DeerFlow sandbox/）
+│   ├── __init__.py      # get_sandbox_provider() 进程级单例 + set_sandbox_provider()
+│   ├── base.py          # 抽象契约：Sandbox / SandboxProvider / PathMapping / SandboxPathError
+│   └── local.py         # LocalSandbox + LocalSandboxProvider（虚拟路径映射 + 防穿越）
 ├── agents/
 │   ├── __init__.py
 │   ├── lead_agent.py    # LeadAgent：多轮 ReAct 循环 + P4 中间件链接入
@@ -91,7 +99,7 @@ mini-deerflow/
 ├── embedding_model.py   # 参考文件：Embedding 模型调用样例
 ├── requirements.txt
 ├── pytest.ini            # pytest 配置
-├── tests/                # P0-P2 测试套件（离线，mock 模型层）
+├── tests/                # P0-P5 测试套件（离线，mock 模型层）
 └── .env.example
 ```
 
@@ -109,7 +117,14 @@ cp .env.example .env
 python main.py "在当前目录建一个 hello.txt 写入 hi 再读回来"   # 单发模式
 python main.py                                                  # 交互模式（输入 exit 退出）
 python main.py --quiet "列出当前目录的文件"                       # 隐藏工具活动 trace
+
+# P5 · 在沙箱内执行工具（虚拟路径 /workspace，防目录穿越）
+SANDBOX_ENABLED=1 python main.py "在 /workspace 建一个 hello.txt 写入 hi 再读回来"
 ```
+
+> P5 沙箱默认关闭；置 `SANDBOX_ENABLED=1`（或 `true`/`yes`/`on`）后，`bash`/`read_file`/`write_file`
+> 三工具改为在沙箱内执行，只认虚拟路径 `/workspace/...`，真实文件落在 `SANDBOX_DIR`（缺省
+> 为源码树旁的 `sandboxes/`）下。Web 服务同样支持 `SANDBOX_ENABLED=1 uvicorn server:app ...`。
 
 运行时默认在 stderr 打印工具调用轨迹，便于观察 ReAct 过程：
 
@@ -163,17 +178,33 @@ python main.py --quiet "列出当前目录的文件"                       # 隐
 5. **事件透传**：中间件 `ctx.emit(...)` 的结构化事件——阻塞路径转发给 `on_event`，流式路径作为 SSE 帧穿插在标准事件间；派生的 `title` / `todos` 落到 `agent.title` / `agent.todos`，Web 层据此回存（`store.set_title` 覆盖派生标题）并在 `/chat` 响应体、`/chat/stream` 的 `done` 帧回传。
 
 
+## 沙箱化执行工作机制（P5）
+
+1. **两层契约（`sandbox/base.py`）**：`Sandbox` 是一个只认虚拟路径的执行环境（`execute_command` / `read_file` / `write_file` / `list_dir`）；`SandboxProvider` 是它的工厂 + 生命周期管理器（`acquire(thread_id) -> id`、`get(id)`、`release(id)`、`reset()`）。应用代码只面向该接口，日后换 `DockerSandboxProvider` 不动任何调用点。
+2. **虚拟路径映射（`PathMapping`）**：每个沙箱持有一组 `virtual_path -> host_path` 绑定。`LocalSandboxProvider` 默认把 `/workspace` 映射到 `<SANDBOX_DIR>/<sandbox_id>/workspace`——按 `thread_id` 隔离，故 P3 的并发会话各有独立工作区；`acquire(None)` 返回共享的 `local` 沙箱（供 CLI / 测试）。
+3. **防目录穿越**：每次路径解析都先在**原始输入**上拦 NUL 字节，再把相对部分拼到主机根、`os.path.realpath` 收敛 `..` 与软链，最后用 `os.path.commonpath` 校验仍落在根内——`../../etc/passwd`、绝对路径 `/etc/passwd`、指向外部的软链都在**任何 I/O 之前**抛 `SandboxPathError`。只读映射的写入抛 `OSError(EROFS)`。
+4. **命令内路径改写 + 输出反向映射**：`execute_command` 以主 `/workspace` 的主机目录为 CWD 运行，先用一段“段边界”正则把命令串里的虚拟路径改写成主机路径（故 `cat /workspace/a.txt` 可用），再把 stdout/stderr 与目录列举里的主机前缀反向映射回虚拟根——主机路径绝不泄露给模型。
+5. **同名工具、稳定入口**：`tools.get_available_tools(sandbox=...)` 传入沙箱时返回由 `make_sandbox_tools` 现造、闭包绑定该沙箱的 `bash`/`read_file`/`write_file`——**工具名与 JSON schema 与主机版逐字段一致**，仅描述文案从主机路径改为虚拟路径。被拦截的穿越降级为纯文本（`[read_file] blocked: ...`）喂回 ReAct 循环。
+6. **默认关闭、显式开启**：`config.SANDBOX_ENABLED`（缺省 False）决定 Web/CLI 是否启用沙箱。`server.py._build_agent` 按 `thread_id` 取沙箱、`main.py` 用通用 `local` 沙箱；关闭时走 P1 主机内置工具，P0–P4 行为逐字节不变。`get_sandbox_provider()` 懒加载进程级单例（根目录由 `config.SANDBOX_DIR` 决定），`set_sandbox_provider()` 便于测试注入 `tmp_path` 版。
+
+> 与 DeerFlow 的对齐点：稳定的 `get_available_tools()` 工具面 + 可替换的沙箱后端，
+> 是后续 P7 MCP 工具、P8 技能系统、P13 Docker `AioSandbox` 的地基。差别在于本阶段
+> 只落零依赖的本地后端，不引入容器 / 网络隔离等重型能力。
+
 ## 设计说明
 
 - **密钥不落地**：统一从环境变量 / `.env` 读取（`config.py`），源码不含密钥。
 - **单点收口模型调用**：所有对 Ark 的调用集中在 `llm.py`，P6「多模型工厂」只需改这一处。
 - **工具可扩展**：新增工具只需在 `tools/builtins.py` 定义并加入 `BUILTIN_TOOLS`；
-  调用入口 `get_available_tools()` 保持稳定，P5 沙箱 / P7 MCP / P8 技能均在此生长。
+  调用入口 `get_available_tools()` 保持稳定。P5 已在此生长出沙箱版工具
+  （`get_available_tools(sandbox=...)`，同名同 schema），P7 MCP / P8 技能续接。
+- **沙箱可替换**：P5 只面向 `SandboxProvider` 抽象，`LocalSandboxProvider` 之外
+  可平滑替换为未来的 `DockerSandboxProvider`（路线图 Docker SDK 后端）而不动调用点。
 - **纯增量、可对齐 DeerFlow**：`agents/lead_agent.py` 保留类形态，后续 P9（子智能体）可直接扩展。
 
 ## 测试
 
-P0–P4 全量单测 + SSE 集成测试，**完全离线**：mock 掉 `llm` 层与 Ark 客户端，不会发起任何网络 / 模型调用，也无需 `ARK_API_KEY`。
+P0–P5 全量单测 + SSE 集成测试，**完全离线**：mock 掉 `llm` 层与 Ark 客户端，不会发起任何网络 / 模型调用，也无需 `ARK_API_KEY`。P5 的沙箱测试全部落在 pytest `tmp_path`，不在临时目录外产生任何文件。
 
 ```bash
 pip install -r requirements.txt   # 含 pytest
@@ -192,10 +223,11 @@ python -m pytest tests/test_p2_server.py -v   # 单文件
 | `tests/test_p3_store.py` | P3 | `ThreadStore` 增删查列、标题派生、`tool_calls` 无损往返、默认 store 访问器 | 10 |
 | `tests/test_p3_server.py` | P3 | `/threads` CRUD、`/chat` 续聊与回存、SSE 首帧 `thread_id`、出错不落库 | 9 |
 | `tests/test_p4_middlewares.py` | P4 | 链按序执行/`after_*`逆序、抛错隔离、生命周期钩子计数与事件透传、Title/TodoList/Summarization 行为、`default_middlewares` 顺序 | 15 |
+| `tests/test_p5_sandbox.py` | P5 | Provider 生命周期(acquire/get/release/reset)与按 thread 隔离、虚拟路径映射与落盘、防穿越(`../`/绝对/软链/NUL)、只读映射 `EROFS`、`get_available_tools(sandbox=)` 路由与同 schema、工具错误文案 | 25 |
 
-共 **98** 个用例。服务层测试用 FastAPI `TestClient`（进程内 ASGI），不绑定端口；
+共 **123** 个用例。服务层测试用 FastAPI `TestClient`（进程内 ASGI），不绑定端口；
 P3 测试通过 autouse fixture 注入 `:memory:` 版 `ThreadStore`，全程离线、不落磁盘。
 
 ## 路线图（后续阶段）
 
-~~P3 会话持久化~~ → ~~P4 中间件链~~（本阶段完成）→ P5 沙箱 → P6 多模型工厂 → P7 MCP → P8 技能系统 → P9 子智能体 → P10 架构分层 → P11 IM 渠道 → P12 定时/长任务 → P13 生产加固。
+~~P3 会话持久化~~ → ~~P4 中间件链~~ → ~~P5 沙箱~~（本阶段完成）→ P6 多模型工厂 → P7 MCP → P8 技能系统 → P9 子智能体 → P10 架构分层 → P11 IM 渠道 → P12 定时/长任务 → P13 生产加固。

@@ -41,11 +41,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+import config
 from agents.lead_agent import LeadAgent
 from agents.middlewares import default_middlewares
+from sandbox import get_sandbox_provider
 from store import get_store
+from tools import get_available_tools
 
-app = FastAPI(title="mini-deerflow", version="0.4.0 (P4)")
+app = FastAPI(title="mini-deerflow", version="0.5.0 (P5)")
 
 
 # --- request / response models ----------------------------------------------
@@ -72,16 +75,28 @@ class CreateThreadRequest(BaseModel):
 
 
 # --- helpers -----------------------------------------------------------------
-def _build_agent(req: ChatRequest) -> LeadAgent:
+def _build_agent(req: ChatRequest, thread_id: str | None = None) -> LeadAgent:
     """Build a lead agent wired with the full P4 middleware stack.
 
     A factory (not a shared chain) is passed so every run gets *fresh*
     middleware instances — TodoList/Title/Summarization hold per-run state that
     must not bleed across conversations.
+
+    P5 (沙箱化执行): when ``config.SANDBOX_ENABLED`` is set, the agent runs its
+    bash / read_file / write_file tools *inside* a per-thread sandbox (virtual
+    paths, traversal-guarded) instead of directly on the host. The sandbox is
+    scoped to ``thread_id`` so concurrent conversations get isolated working
+    areas. When the flag is off, the classic host builtins are used and P1-P4
+    behaviour is unchanged.
     """
     kwargs: dict[str, Any] = {"middleware_factory": default_middlewares}
     if req.max_steps is not None:
         kwargs["max_steps"] = req.max_steps
+    if config.SANDBOX_ENABLED:
+        provider = get_sandbox_provider()
+        sandbox_id = provider.acquire(thread_id)
+        sandbox = provider.get(sandbox_id)
+        kwargs["tools"] = get_available_tools(sandbox=sandbox)
     return LeadAgent(**kwargs)
 
 
@@ -111,7 +126,7 @@ def _resolve_thread(thread_id: str | None) -> tuple[str, list[dict[str, Any]]]:
 @app.get("/health")
 def health() -> dict[str, str]:
     """Liveness probe."""
-    return {"status": "ok", "phase": "P4"}
+    return {"status": "ok", "phase": "P5"}
 
 
 @app.post("/chat")
@@ -122,8 +137,8 @@ def chat(req: ChatRequest) -> dict[str, Any]:
     updated conversation back to the thread. Returns the final content plus the
     ``thread_id`` the client should reuse to continue the conversation.
     """
-    agent = _build_agent(req)
     thread_id, history = _resolve_thread(req.thread_id)
+    agent = _build_agent(req, thread_id)
 
     content = ""
     error: str | None = None
@@ -158,8 +173,8 @@ def chat_stream(req: ChatRequest) -> StreamingResponse:
     a trailing ``done`` frame. On a clean (non-error) finish the updated
     conversation is saved back to the thread store.
     """
-    agent = _build_agent(req)
     thread_id, history = _resolve_thread(req.thread_id)
+    agent = _build_agent(req, thread_id)
 
     def event_source() -> Iterator[str]:
         yield _sse("thread_id", {"thread_id": thread_id})

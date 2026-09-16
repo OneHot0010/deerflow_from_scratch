@@ -1,0 +1,59 @@
+# P6 example: declare every model you might want to use here, then reference it
+# by alias from code (or leave `default_chat` blank to keep the P0 fallback).
+#
+# Copy this file to `models.yaml` (or point at it via MODELS_CONFIG=/path/to.yaml)
+# to activate. The factory instantiates entries lazily, so entries you never
+# name via `llm.chat(model="...")` cost nothing.
+
+default_chat: ark-main
+default_embedding: ark-embed
+
+chat:
+  ark-main:
+    class: models.providers.ark:ArkChatModel
+    params:
+      model: doubao-seed-1-6-250615
+      thinking: false
+      vision: true
+
+  ark-thinking:
+    class: models.providers.ark:ArkChatModel
+    params:
+      model: doubao-seed-1-6-250615
+      thinking: true
+
+  # OpenAI (or any OpenAI-compatible endpoint via `base_url`).
+  gpt-4o-mini:
+    class: models.providers.openai:OpenAIChatModel
+    params:
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      vision: true
+
+  # DeepSeek — same adapter, different base_url / key env.
+  deepseek-chat:
+    class: models.providers.openai:OpenAIChatModel
+    params:
+      model: deepseek-chat
+      base_url: https://api.deepseek.com/v1
+      api_key_env: DEEPSEEK_API_KEY
+
+  deepseek-reasoner:
+    class: models.providers.openai:OpenAIChatModel
+    params:
+      model: deepseek-reasoner
+      base_url: https://api.deepseek.com/v1
+      api_key_env: DEEPSEEK_API_KEY
+      thinking: true
+
+embedding:
+  ark-embed:
+    class: models.providers.ark:ArkEmbeddingModel
+    params:
+      model: doubao-embedding-vision-251215
+
+  openai-embed:
+    class: models.providers.openai:OpenAIEmbeddingModel
+    params:
+      model: text-embedding-3-small
+      api_key_env: OPENAI_API_KEY

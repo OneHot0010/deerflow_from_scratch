@@ -132,9 +132,9 @@ def scripted_chat(monkeypatch):
         queue = list(messages)
         recorded: list[dict] = []
 
-        def fake_chat(msgs, model=None, temperature=0.7, tools=None, tool_choice=None):
+        def fake_chat(msgs, model=None, temperature=0.7, tools=None, tool_choice=None, **extra):
             recorded.append(
-                {"messages": msgs, "tools": tools, "tool_choice": tool_choice}
+                {"messages": msgs, "tools": tools, "tool_choice": tool_choice, "extra": extra}
             )
             return queue.pop(0) if queue else make_message("")
 
@@ -158,9 +158,9 @@ def scripted_stream(monkeypatch):
         queue = list(turns)
         recorded: list[dict] = []
 
-        def fake_stream(msgs, model=None, temperature=0.7, tools=None, tool_choice=None):
+        def fake_stream(msgs, model=None, temperature=0.7, tools=None, tool_choice=None, **extra):
             recorded.append(
-                {"messages": list(msgs), "tools": tools, "tool_choice": tool_choice}
+                {"messages": list(msgs), "tools": tools, "tool_choice": tool_choice, "extra": extra}
             )
             chunks = queue.pop(0) if queue else []
             for ch in chunks:
@@ -190,3 +190,30 @@ def _isolated_thread_store():
     finally:
         fresh.close()
         _store.set_store(None)
+
+
+# --- P6: reset the process-level ModelFactory between tests -----------------
+@pytest.fixture(autouse=True)
+def _isolated_model_factory():
+    """Clear the cached factory so each test rebuilds it from a clean slate.
+
+    Without this, one test's ``set_factory(...)`` (or a first-call load of
+    ``models.yaml``) would leak into later tests and hide regressions. Kept
+    autouse so every test — including the older P0-P5 ones — starts with
+    ``get_factory()`` freshly resolving whatever env / config the test controls.
+    Also resets the Ark provider's client-factory hook and the reflection
+    cache so nothing survives across test boundaries.
+    """
+    import models as _models
+    from models import reflection as _reflection
+    from models.providers import ark as _ark
+
+    _models.set_factory(None)
+    _reflection.clear_cache()
+    _ark.set_client_factory(None)
+    try:
+        yield
+    finally:
+        _models.set_factory(None)
+        _reflection.clear_cache()
+        _ark.set_client_factory(None)

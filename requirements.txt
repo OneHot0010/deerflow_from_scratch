@@ -7,3 +7,6 @@ uvicorn>=0.29
 
 # Tests (P0-P2): offline unit + SSE integration suite.
 pytest>=8
+
+# P6: models.yaml config parsing (with a tiny fallback if PyYAML is absent).
+PyYAML>=6

@@ -8,8 +8,12 @@ P5 (沙箱化执行): when ``config.SANDBOX_ENABLED`` is set, the CLI runs those
 *inside* a sandbox (virtual paths, traversal-guarded) instead of directly on the
 host. The CLI has no conversation thread, so it uses the provider's generic
 sandbox (``acquire(None)`` -> the shared ``/workspace`` rooted under
-``config.SANDBOX_DIR``). When the flag is off, the classic host builtins run and
-P1-P4 behaviour is unchanged.
+``config.SANDBOX_DIR``).
+
+P7 (MCP 工具集成): when ``config.MCP_ENABLED`` is set, the tools exposed by the
+enabled MCP servers in ``mcp.yaml`` are appended to the agent's tool set
+(namespaced ``<server>__<tool>``). The two switches compose. When both flags are
+off the classic host builtins run and P1-P4 behaviour is unchanged.
 
 Usage:
     # single-shot
@@ -23,6 +27,9 @@ Usage:
 
     # run tools inside the sandbox
     SANDBOX_ENABLED=1 python main.py "在 /workspace 建一个 hello.txt"
+
+    # connect external MCP servers declared in mcp.yaml
+    MCP_ENABLED=1 python main.py "用 filesystem 工具读一下 README"
 """
 from __future__ import annotations
 
@@ -54,19 +61,25 @@ def _make_tracer(enabled: bool):
 
 
 def _build_agent(on_event) -> LeadAgent:
-    """Construct the lead agent, wiring sandboxed tools when enabled.
+    """Construct the lead agent, wiring sandboxed and/or MCP tools when enabled.
 
     Mirrors ``server.py``'s ``_build_agent``: with ``config.SANDBOX_ENABLED`` on,
     the bash / read_file / write_file tools are bound to the provider's generic
-    sandbox (the CLI has no thread context, so ``acquire(None)``); otherwise the
-    host builtins are used and behaviour is identical to P1-P4.
+    sandbox (the CLI has no thread context, so ``acquire(None)``). With
+    ``config.MCP_ENABLED`` on, the tools exposed by the enabled MCP servers are
+    appended (namespaced ``<server>__<tool>``). Both switches compose; with
+    neither set the host builtins are used and behaviour is identical to P1-P4.
     """
     kwargs: dict = {"on_event": on_event}
+    sandbox = None
     if config.SANDBOX_ENABLED:
         provider = get_sandbox_provider()
         sandbox_id = provider.acquire(None)
         sandbox = provider.get(sandbox_id)
-        kwargs["tools"] = get_available_tools(sandbox=sandbox)
+    if config.SANDBOX_ENABLED or config.MCP_ENABLED:
+        kwargs["tools"] = get_available_tools(
+            sandbox=sandbox, include_mcp=config.MCP_ENABLED
+        )
     return LeadAgent(**kwargs)
 
 
@@ -96,8 +109,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Interactive mode.
     banner = "mini-deerflow P5 · tool-calling agent"
+    extras = []
     if config.SANDBOX_ENABLED:
-        banner += " (sandboxed)"
+        extras.append("sandboxed")
+    if config.MCP_ENABLED:
+        extras.append("mcp")
+    if extras:
+        banner += " (" + ", ".join(extras) + ")"
     print(f"{banner}. Type 'exit' or Ctrl-D to quit.")
     while True:
         try:

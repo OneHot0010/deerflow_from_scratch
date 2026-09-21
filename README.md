@@ -4,21 +4,23 @@
 
 模型调用统一走火山方舟(Volcengine Ark) SDK，参考自 `call_llm.py`（Chat）与 `embedding_model.py`（Embedding）。
 
-## 当前阶段：P5 · 沙箱化执行
+## 当前阶段：P7 · MCP 工具集成
 
 | 项 | 内容 |
 |---|---|
-| 目标产物 | 让工具的命令与文件操作在一个**隔离环境（Sandbox）**内执行：仅认**虚拟路径**（`/workspace/...`），映射到真实主机目录，且**防目录穿越** |
-| 对标模块 | DeerFlow 的 `sandbox/` 模块（`SandboxProvider` 抽象 + `LocalSandbox`） |
-| 核心功能点 | 1) `SandboxProvider` 抽象接口（工厂 + 生命周期 `acquire/get/release/reset`）  2) `LocalSandboxProvider`（开发用本地后端，零新依赖）  3) 虚拟路径映射 `PathMapping`（`/workspace` → 主机目录）  4) 防目录穿越（`realpath` + `commonpath` 容纳性校验，拦 `../`、绝对路径逃逸、软链外指、NUL 字节） |
-| 验收标准 | 工具执行在沙箱内、虚拟路径正确映射、防目录穿越；命令输出与目录列举反向映射回虚拟路径不泄露主机路径；只读映射拒绝写入（`EROFS`） |
+| 目标产物 | 让 Agent **可配置地连接外部 MCP 服务器**（GitHub / filesystem 等），把它们暴露的工具**动态**折叠进与内置工具同一个注册表——LLM 调用远程 MCP 工具与调用本地 `bash`/`read_file` 完全一致 |
+| 对标模块 | DeerFlow 的 `mcp/` 模块（`MultiServerMCPClient` + 每服务器一个 transport 会话） |
+| 核心功能点 | 1) **stdio / SSE / HTTP 三种传输**（分别走 stdlib `subprocess` / `urllib`，零新依赖）  2) **工具缓存(mtime 失效)**：`mcp.yaml` 改动自动失效重建  3) **命名空间隔离**：每个工具以 `<server>__<tool>` 暴露，两服务器同名工具不冲突  4) **运行时热重载**（`reload()` / `add_server()`）与每服务器错误隔离（坏服务器降级为零工具，不拖垮健康服务器） |
+| 验收标准 | 可配置连接 MCP 服务器、工具动态生效；坏服务器不影响健康服务器；MCP 默认关闭时 P0–P6 行为与其离线测试逐字节不变 |
 
-> 说明：延续“最小可运行、零新依赖”的原则(纯 `os`/`pathlib`/`subprocess`)。沙箱默认**关闭**
-> （`config.SANDBOX_ENABLED` 缺省 False，`get_available_tools(sandbox=None)`），故 P0–P4 行为
-> 与其离线测试逐字节不变；Web/CLI 层显式开启后，`bash`/`read_file`/`write_file` 三工具改为在
-> 沙箱内执行——**工具名与 schema 完全不变**，调用点 `get_available_tools()` 保持稳定。
-> Docker 后端是路线图“关键技术”的远期目标，本阶段只落 `LocalSandboxProvider(开发)`；
-> 抽象已按“换 `DockerSandboxProvider` 不动调用点”的形态预留。
+> 说明：延续“最小可运行、零新依赖”的原则——三种传输直接用 stdlib（`subprocess` 起子进程走 stdio、
+> `urllib` POST 走 streamable HTTP / SSE）说 MCP JSON-RPC 2.0 协议（`initialize` →
+> `notifications/initialized` → `tools/list` → `tools/call`）。官方 `mcp` SDK /
+> `langchain-mcp-adapters` 是“关键技术”的远期后端：抽象已按“换 `McpSdkSession(MCPSession)`
+> 不动 client 与工具层”的形态预留。MCP **默认关闭**：无 `mcp.yaml`（且 `config.MCP_ENABLED`
+> 缺省 False）时 client 零服务器、贡献零工具，故 P0–P6 行为与其离线测试逐字节不变；Web/CLI 层
+> 显式 `MCP_ENABLED=1` 开启后，`mcp.yaml` 里声明的服务器工具方才动态生效——**内置工具名与
+> schema 完全不变**，调用点 `get_available_tools()` 保持稳定（新增可选 `include_mcp=`）。
 
 ### SSE 事件协议
 
@@ -76,10 +78,10 @@ curl -X DELETE localhost:8000/threads/<TID> # 删除会话
 
 ```
 mini-deerflow/
-├── config.py            # 环境变量 / .env 读取，API Key/模型名 + P5 SANDBOX_DIR/SANDBOX_ENABLED
+├── config.py            # 环境变量 / .env 读取，API Key/模型名 + P5 SANDBOX_* + P7 MCP_ENABLED/MCP_CONFIG
 ├── llm.py               # Ark SDK 封装：chat()(含 tool_calls) / chat_completion() / embed()
 ├── tools/
-│   ├── __init__.py      # get_available_tools() 注册入口（对标 DeerFlow tools/）
+│   ├── __init__.py      # get_available_tools() 注册入口（含 P5 sandbox= / P7 include_mcp= 可选参）
 │   ├── base.py          # Tool 抽象：callable + JSON schema + 安全 run()
 │   ├── builtins.py      # 内置工具（主机直连）：bash / read_file / write_file
 │   └── sandbox_tools.py # P5 沙箱版三工具：同名同 schema，绑定到 Sandbox（虚拟路径）
@@ -87,6 +89,11 @@ mini-deerflow/
 │   ├── __init__.py      # get_sandbox_provider() 进程级单例 + set_sandbox_provider()
 │   ├── base.py          # 抽象契约：Sandbox / SandboxProvider / PathMapping / SandboxPathError
 │   └── local.py         # LocalSandbox + LocalSandboxProvider（虚拟路径映射 + 防穿越）
+├── mcp/                 # P7 MCP 工具集成（对标 DeerFlow mcp/）
+│   ├── __init__.py      # get_mcp_client() 进程级单例 + set_mcp_client()（便于测试注入）
+│   ├── base.py          # 抽象契约：MCPTransport / MCPServerConfig / MCPToolSpec / MCPSession + 三类错误
+│   ├── client.py        # MultiServerMCPClient：多服务器连接 + 工具发现/命名空间 + mtime 缓存 + 热重载
+│   └── transports.py    # StdioSession / HttpSession / SseSession + JSON-RPC 2.0 收发（stdlib）
 ├── agents/
 │   ├── __init__.py
 │   ├── lead_agent.py    # LeadAgent：多轮 ReAct 循环 + P4 中间件链接入
@@ -98,8 +105,9 @@ mini-deerflow/
 ├── call_llm.py          # 参考文件：Chat 模型调用样例
 ├── embedding_model.py   # 参考文件：Embedding 模型调用样例
 ├── requirements.txt
+├── mcp.example.yaml      # P7 MCP 服务器配置样例（复制为 mcp.yaml 并置 MCP_ENABLED=1 生效）
 ├── pytest.ini            # pytest 配置
-├── tests/                # P0-P5 测试套件（离线，mock 模型层）
+├── tests/                # P0-P7 测试套件（离线，mock 模型层 / 假 MCP 会话）
 └── .env.example
 ```
 
@@ -120,11 +128,18 @@ python main.py --quiet "列出当前目录的文件"                       # 隐
 
 # P5 · 在沙箱内执行工具（虚拟路径 /workspace，防目录穿越）
 SANDBOX_ENABLED=1 python main.py "在 /workspace 建一个 hello.txt 写入 hi 再读回来"
+
+# P7 · 连接外部 MCP 服务器（先 cp mcp.example.yaml mcp.yaml 并按需编辑）
+MCP_ENABLED=1 python main.py "用 filesystem 的工具读一下 README 的开头"
 ```
 
 > P5 沙箱默认关闭；置 `SANDBOX_ENABLED=1`（或 `true`/`yes`/`on`）后，`bash`/`read_file`/`write_file`
 > 三工具改为在沙箱内执行，只认虚拟路径 `/workspace/...`，真实文件落在 `SANDBOX_DIR`（缺省
 > 为源码树旁的 `sandboxes/`）下。Web 服务同样支持 `SANDBOX_ENABLED=1 uvicorn server:app ...`。
+>
+> P7 MCP 默认关闭；置 `MCP_ENABLED=1` 并提供 `mcp.yaml`（或用 `MCP_CONFIG` 指向别处）后，声明的
+> MCP 服务器工具以 `<server>__<tool>` 追加进工具集，与沙箱开关**可组合**。两开关皆关时走 P1 主机内置
+> 工具，P0–P6 行为逐字节不变。
 
 运行时默认在 stderr 打印工具调用轨迹，便于观察 ReAct 过程：
 
@@ -191,25 +206,44 @@ SANDBOX_ENABLED=1 python main.py "在 /workspace 建一个 hello.txt 写入 hi �
 > 是后续 P7 MCP 工具、P8 技能系统、P13 Docker `AioSandbox` 的地基。差别在于本阶段
 > 只落零依赖的本地后端，不引入容器 / 网络隔离等重型能力。
 
+## 多模型工厂工作机制（P6）
+
+1. **抽象基类（`models/base.py`）**：`BaseChatModel` / `BaseEmbeddingModel` 定义与实现无关的调用面（`chat` / `stream_chat` / `embed`）+ `ModelCapabilities`（是否支持工具、流式、思考、embedding）。
+2. **反射装配（`models/reflection.py`）**：`resolve_class` 按“规范名 / 点分全路径”把配置里的字符串解析成具体 provider 类并缓存——`models.yaml` 改 provider 名即可换实现，无需改代码。
+3. **工厂（`models/factory.py`）**：`ModelFactory` 解析 `models.yaml`（PyYAML，缺省用 `_tiny_yaml_load` 微型回退），按别名懒加载模型实例、解析默认模型、透出能力自省；无 `models.yaml` 时回退内置 Ark 配置。
+4. **收口 `llm.py`**：`chat / stream_chat / embed` 全部改走工厂——**改配置即可切换模型**，调用点不动。`get_factory()` 进程级单例、`set_factory()` 便于测试注入。
+
+## MCP 工具集成工作机制（P7）
+
+1. **两层契约（`mcp/base.py`）**：`MCPSession` 是“到单个 MCP 服务器的一条活连接”，生命周期镜像 MCP 协议——`initialize()`（握手，幂等）→ `list_tools()`（发现工具）→ `call_tool()`（按原始名调用）→ `close()`（拆传输）；`MCPServerConfig`（冻结 dataclass）声明一台服务器的连接（`transport` + stdio 的 `command`/`args`/`env` 或 sse/http 的 `url`/`headers`），`validate()` 按 transport 校验必填、`namespace()` 给工具名加 `<server>__` 前缀；`MCPToolSpec` 是发现到的工具元数据（name / description / JSON schema）。`MCPError` / `MCPTransportError` / `MCPToolError` 三类错误让工具层能区分“连不上”与“工具跑了但报错”。
+2. **三种传输（`mcp/transports.py`，零新依赖）**：`_JsonRpcSession` owns JSON-RPC 2.0 记账（单调 id、`initialize`→`notifications/initialized` 握手、`tools/list`/`tools/call` 塑形、`content` 块拍平、`isError`→`MCPToolError`），子类只实现“字节怎么走”——`StdioSession` 用 `subprocess.Popen` 行缓冲收发、`HttpSession` 用 `urllib` POST（`text/event-stream` 时按 SSE 解析）、`SseSession` 是 `_force_sse=True` 的 HTTP 特化。`create_session` 按 `transport` 路由。工具输出统一 `_truncate` 到 20k 字符，防止话痨工具撑爆上下文。
+3. **多服务器 client（`mcp/client.py`）**：`MultiServerMCPClient` 持有一组配置，**懒连接**（首次发现工具时才起会话并复用）、**每服务器错误隔离**（坏服务器记进 `self.errors` 并跳过，不拖垮健康服务器）、**命名空间隔离**（`<server>__<tool>`）。发现到的工具渲染成 `tools.base.Tool`，其 `func` 闭包持有活会话与原始工具名、错误降级为 `[mcp-error] ...` 文本喂回 ReAct 循环。`${VAR}` 环境变量在解析时展开（密钥不落配置文件）。
+4. **工具缓存(mtime 失效) + 运行时热重载**：`get_tools()` 缓存结果，`mcp.yaml` 的 mtime 变化时透明重建；`reload()`（改文件后手动热重载）/`add_server()`（运行时注册新服务器）/`get_tools(force=True)` 都能强制失效。
+5. **稳定入口、默认关闭**：`tools.get_available_tools(include_mcp=True)` 把 MCP 工具追加进池，与 `sandbox=` **可组合**；`config.MCP_ENABLED`（缺省 False）决定 Web/CLI 是否开启，`server.py`/`main.py` 的 `_build_agent` 据此拼装。`get_mcp_client()` 懒加载进程级单例（配置路径由 `config.MCP_CONFIG` 或源码树旁的 `mcp.yaml` 决定），`set_mcp_client()` 便于测试注入假会话工厂——故全套测试离线、绝不起子进程 / 开 socket。无 `mcp.yaml`（且 `MCP_ENABLED` 关）时 client 零服务器、贡献零工具，P0–P6 逐字节不变。
+
+> 与 DeerFlow 的对齐点：`MultiServerMCPClient` + 每服务器 transport 会话 + 命名空间化工具面，
+> 让远程 MCP 工具与本地工具在同一注册表里被 LLM 平等调用。差别在于本阶段只落零依赖的 stdlib
+> 传输，官方 `mcp` SDK / `langchain-mcp-adapters` 作为可平滑替换的远期后端预留在 `MCPSession` 之后。
+
 ## 设计说明
 
-- **密钥不落地**：统一从环境变量 / `.env` 读取（`config.py`），源码不含密钥。
-- **单点收口模型调用**：所有对 Ark 的调用集中在 `llm.py`，P6「多模型工厂」只需改这一处。
+- **密钥不落地**：统一从环境变量 / `.env` 读取（`config.py`），源码不含密钥；MCP 配置里的 `${VAR}` 亦在加载时从环境展开。
+- **单点收口模型调用**：所有对 Ark 的调用集中在 `llm.py`，P6「多模型工厂」已把它改走工厂。
 - **工具可扩展**：新增工具只需在 `tools/builtins.py` 定义并加入 `BUILTIN_TOOLS`；
-  调用入口 `get_available_tools()` 保持稳定。P5 已在此生长出沙箱版工具
-  （`get_available_tools(sandbox=...)`，同名同 schema），P7 MCP / P8 技能续接。
-- **沙箱可替换**：P5 只面向 `SandboxProvider` 抽象，`LocalSandboxProvider` 之外
-  可平滑替换为未来的 `DockerSandboxProvider`（路线图 Docker SDK 后端）而不动调用点。
+  调用入口 `get_available_tools()` 保持稳定。P5 已生长出沙箱版工具（`sandbox=`），
+  P7 已折入 MCP 远程工具（`include_mcp=`），P8 技能续接。
+- **沙箱 / MCP 均可替换**：P5 面向 `SandboxProvider` 抽象、P7 面向 `MCPSession` 抽象，
+  本地 / stdlib 后端之外可平滑替换为 `DockerSandboxProvider` / `McpSdkSession` 而不动调用点。
 - **纯增量、可对齐 DeerFlow**：`agents/lead_agent.py` 保留类形态，后续 P9（子智能体）可直接扩展。
 
 ## 测试
 
-P0–P5 全量单测 + SSE 集成测试，**完全离线**：mock 掉 `llm` 层与 Ark 客户端，不会发起任何网络 / 模型调用，也无需 `ARK_API_KEY`。P5 的沙箱测试全部落在 pytest `tmp_path`，不在临时目录外产生任何文件。
+P0–P7 全量单测 + SSE 集成测试，**完全离线**：mock 掉 `llm` 层与 Ark 客户端、MCP 用假会话工厂注入（绝不起子进程 / 开 socket），不会发起任何网络 / 模型调用，也无需 `ARK_API_KEY`。P5 的沙箱测试全部落在 pytest `tmp_path`，不在临时目录外产生任何文件。
 
 ```bash
 pip install -r requirements.txt   # 含 pytest
 python -m pytest                   # 跑全部
-python -m pytest tests/test_p2_server.py -v   # 单文件
+python -m pytest tests/test_p7_mcp.py -v   # 单文件
 ```
 
 | 测试文件 | 阶段 | 覆盖 | 用例数 |
@@ -224,10 +258,12 @@ python -m pytest tests/test_p2_server.py -v   # 单文件
 | `tests/test_p3_server.py` | P3 | `/threads` CRUD、`/chat` 续聊与回存、SSE 首帧 `thread_id`、出错不落库 | 9 |
 | `tests/test_p4_middlewares.py` | P4 | 链按序执行/`after_*`逆序、抛错隔离、生命周期钩子计数与事件透传、Title/TodoList/Summarization 行为、`default_middlewares` 顺序 | 15 |
 | `tests/test_p5_sandbox.py` | P5 | Provider 生命周期(acquire/get/release/reset)与按 thread 隔离、虚拟路径映射与落盘、防穿越(`../`/绝对/软链/NUL)、只读映射 `EROFS`、`get_available_tools(sandbox=)` 路由与同 schema、工具错误文案 | 25 |
+| `tests/test_p6_models.py` | P6 | 反射装配、`ModelFactory` 配置解析/懒加载/别名/默认/能力自省/Ark 回退、Ark 适配器参数装配与流式、`llm` 收口改配置切换 | (见文件) |
+| `tests/test_p7_mcp.py` | P7 | transport 枚举 `coerce`、配置校验/命名空间、`parse_servers`/env 展开、多服务器发现/命名空间/错误隔离、mtime 缓存/`reload`/`add_server`、`[mcp-error]` 降级、JSON-RPC 握手/`tools/list`/`tools/call`/`isError`、SSE 抽取、`create_session` 路由、单例、`get_available_tools(include_mcp=)` 合并 | (见文件) |
 
-共 **123** 个用例。服务层测试用 FastAPI `TestClient`（进程内 ASGI），不绑定端口；
-P3 测试通过 autouse fixture 注入 `:memory:` 版 `ThreadStore`，全程离线、不落磁盘。
+服务层测试用 FastAPI `TestClient`（进程内 ASGI），不绑定端口；`:memory:` 版 `ThreadStore`、
+空 MCP client 均由 autouse fixture 逐测重置，全程离线、不落磁盘、不起子进程。
 
 ## 路线图（后续阶段）
 
-~~P3 会话持久化~~ → ~~P4 中间件链~~ → ~~P5 沙箱~~（本阶段完成）→ P6 多模型工厂 → P7 MCP → P8 技能系统 → P9 子智能体 → P10 架构分层 → P11 IM 渠道 → P12 定时/长任务 → P13 生产加固。
+~~P3 会话持久化~~ → ~~P4 中间件链~~ → ~~P5 沙箱~~ → ~~P6 多模型工厂~~ → ~~P7 MCP~~（本阶段完成）→ P8 技能系统 → P9 子智能体 → P10 架构分层 → P11 IM 渠道 → P12 定时/长任务 → P13 生产加固。

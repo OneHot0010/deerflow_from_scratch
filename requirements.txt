@@ -10,3 +10,9 @@ pytest>=8
 
 # P6: models.yaml config parsing (with a tiny fallback if PyYAML is absent).
 PyYAML>=6
+
+# P7: MCP tool integration adds *zero* new dependencies — the stdio / SSE / HTTP
+# transports speak MCP JSON-RPC directly over the stdlib (``subprocess`` +
+# ``urllib``). ``mcp.yaml`` is parsed with the same PyYAML (with tiny fallback)
+# already listed above. The official ``mcp`` SDK / ``langchain-mcp-adapters``
+# remain aspirational backends that can slot in behind ``MCPSession`` later.

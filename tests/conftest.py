@@ -217,3 +217,24 @@ def _isolated_model_factory():
         _models.set_factory(None)
         _reflection.clear_cache()
         _ark.set_client_factory(None)
+
+
+# --- P7: reset the process-level MCP client between tests -------------------
+@pytest.fixture(autouse=True)
+def _isolated_mcp_client():
+    """Clear the cached MCP client so each test starts fully inert.
+
+    Without this, one test's ``set_mcp_client(...)`` (or a first-call build from
+    ``mcp.yaml``) would leak into later tests — and a real singleton could try
+    to spawn a subprocess / open a socket. Autouse so every test — including the
+    older P0-P6 ones — begins with no MCP client installed (``get_mcp_client()``
+    then rebuilds from whatever config the test controls, which is "no servers"
+    by default, keeping MCP contributing zero tools).
+    """
+    import mcp as _mcp
+
+    _mcp.set_mcp_client(None)
+    try:
+        yield
+    finally:
+        _mcp.set_mcp_client(None)

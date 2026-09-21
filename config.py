@@ -82,3 +82,22 @@ SANDBOX_ENABLED: bool = os.getenv("SANDBOX_ENABLED", "").strip().lower() in {
     "yes",
     "on",
 }
+
+
+# --- P7: MCP tool integration -----------------------------------------------
+# Whether external MCP servers declared in ``mcp.yaml`` are contacted and the
+# tools they expose folded into the agent's tool registry. Off by default so
+# P0-P6 behaviour and their offline tests are byte-for-byte unchanged; even when
+# on, the client stays fully inert unless an ``mcp.yaml`` actually declares a
+# server. The web/CLI layers opt in. Accepts 1/true/yes/on (case-insensitive).
+MCP_ENABLED: bool = os.getenv("MCP_ENABLED", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# Optional path override for the MCP server config file. When unset the MCP
+# layer looks for ``mcp.yaml`` next to the source tree (see ``mcp/client.py``),
+# mirroring how ``MODELS_CONFIG`` overrides the P6 model factory's config path.
+MCP_CONFIG: str = os.getenv("MCP_CONFIG", "")

@@ -86,17 +86,27 @@ def _build_agent(req: ChatRequest, thread_id: str | None = None) -> LeadAgent:
     bash / read_file / write_file tools *inside* a per-thread sandbox (virtual
     paths, traversal-guarded) instead of directly on the host. The sandbox is
     scoped to ``thread_id`` so concurrent conversations get isolated working
-    areas. When the flag is off, the classic host builtins are used and P1-P4
+    areas.
+
+    P7 (MCP 工具集成): when ``config.MCP_ENABLED`` is set, the tools exposed by
+    the enabled MCP servers in ``mcp.yaml`` are discovered and appended to the
+    agent's tool set (namespaced ``<server>__<tool>``). The two switches
+    compose: MCP tools ride alongside either the host builtins or the sandbox
+    trio. When both flags are off the classic host builtins are used and P1-P4
     behaviour is unchanged.
     """
     kwargs: dict[str, Any] = {"middleware_factory": default_middlewares}
     if req.max_steps is not None:
         kwargs["max_steps"] = req.max_steps
+    sandbox = None
     if config.SANDBOX_ENABLED:
         provider = get_sandbox_provider()
         sandbox_id = provider.acquire(thread_id)
         sandbox = provider.get(sandbox_id)
-        kwargs["tools"] = get_available_tools(sandbox=sandbox)
+    if config.SANDBOX_ENABLED or config.MCP_ENABLED:
+        kwargs["tools"] = get_available_tools(
+            sandbox=sandbox, include_mcp=config.MCP_ENABLED
+        )
     return LeadAgent(**kwargs)
 
 

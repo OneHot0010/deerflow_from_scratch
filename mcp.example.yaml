@@ -1,0 +1,43 @@
+# mini-deerflow MCP server config (P7: MCP 工具集成).
+#
+# Copy this to ``mcp.yaml`` next to the source tree (or point ``MCP_CONFIG`` at
+# it) and set ``MCP_ENABLED=1`` to have the agent connect to these external MCP
+# servers and fold the tools they expose into its tool registry. Each tool is
+# surfaced to the LLM namespaced as ``<server>__<tool>`` (so two servers can
+# expose a same-named tool without colliding).
+#
+# With no ``mcp.yaml`` (or ``MCP_ENABLED`` unset) the MCP layer is fully inert
+# and contributes zero tools — P0-P6 behaviour is unchanged.
+#
+# Three transports are supported:
+#   - stdio : spawn a local subprocess, exchange JSON-RPC over its stdin/stdout.
+#   - http  : "streamable HTTP" — JSON-RPC POSTed to a single endpoint URL.
+#   - sse   : the older HTTP + Server-Sent Events transport.
+#
+# ``${VAR}`` references anywhere below are expanded from the environment at load
+# time, so secrets (auth tokens) live in the env / .env, never in this file.
+
+servers:
+  # A local filesystem server run over stdio (spawned via npx).
+  filesystem:
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+    # env: {FOO: bar}          # extra env for the subprocess (merged over os.environ)
+    enabled: true
+    # tool_prefix: fs          # override the namespace prefix (defaults to the server name)
+    # timeout: 30              # per-request wall-clock timeout (seconds)
+
+  # A remote server over streamable HTTP, authenticated via an env-var token.
+  github:
+    transport: http
+    url: https://mcp.example.com/github
+    headers:
+      Authorization: Bearer ${GITHUB_MCP_TOKEN}
+    enabled: false
+
+  # A remote server over HTTP + Server-Sent Events, declared but dormant.
+  docs:
+    transport: sse
+    url: https://mcp.example.com/docs/sse
+    enabled: false
